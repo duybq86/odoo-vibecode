@@ -1,0 +1,625 @@
+name: Odoo AI Gen Code - AI Gateway
+run-name: ${{ inputs.odoo_task_name }}
+on:
+  workflow_dispatch:
+    inputs:
+      odoo_task_id:
+        description: Odoo task ID
+        required: true
+        type: string
+      odoo_task_name:
+        description: Odoo task name
+        required: true
+        type: string
+      odoo_task_description:
+        description: Odoo task description
+        required: true
+        type: string
+      odoo_task_url:
+        description: Odoo task URL
+        required: false
+        type: string
+      odoo_project_id:
+        description: Odoo project ID
+        required: false
+        type: string
+      odoo_project_name:
+        description: Odoo project name
+        required: false
+        type: string
+      odoo_ai_provider:
+        description: AI provider key from Odoo workflow record
+        required: false
+        default: ai
+        type: string
+      odoo_reference_repositories:
+        description: JSON list of reference Git repositories configured in Odoo
+        required: false
+        default: '[]'
+        type: string
+      odoo_execution_mode:
+        description: plan or generate
+        required: false
+        default: plan
+        type: string
+      odoo_ai_plan:
+        description: Approved AI plan from Odoo
+        required: false
+        default: ''
+        type: string
+      odoo_ai_correction:
+        description: Correction feedback
+        required: false
+        default: ''
+        type: string
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+jobs:
+  review_pr:
+    name: Review PR Context
+    runs-on: ubuntu-latest
+    outputs:
+      ai_provider: ${{ steps.context.outputs.ai_provider }}
+      execution_mode: ${{ steps.context.outputs.execution_mode }}
+      branch_name: ${{ steps.context.outputs.branch_name }}
+      pr_title: ${{ steps.context.outputs.pr_title }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Review Odoo task context
+      id: context
+      shell: bash
+      run: |
+        set -euo pipefail
+        AI_PROVIDER="${{ inputs.odoo_ai_provider }}"
+        if [ -z "$AI_PROVIDER" ]; then
+          AI_PROVIDER="ai"
+        fi
+        EXECUTION_MODE="${{ inputs.odoo_execution_mode }}"
+        if [ -z "$EXECUTION_MODE" ]; then
+          EXECUTION_MODE="plan"
+        fi
+        {
+          echo "ai_provider=$AI_PROVIDER"
+          echo "execution_mode=$EXECUTION_MODE"
+          echo "branch_name=odoo-task/${{ inputs.odoo_task_id }}"
+          echo "pr_title=[Odoo Task] ${{ inputs.odoo_task_name }}"
+        } >> "$GITHUB_OUTPUT"
+  describe_plan:
+    name: Describe Implementation Plan
+    runs-on: ubuntu-latest
+    needs: review_pr
+    if: needs.review_pr.outputs.execution_mode == 'plan'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Checkout reference repositories
+      shell: bash
+      env:
+        ODOO_REFERENCE_REPOSITORIES: ${{ inputs.odoo_reference_repositories }}
+        REFERENCE_REPOSITORY_TOKEN: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
+      run: |
+        set -euo pipefail
+        mkdir -p .odoo-reference-repositories
+        if [ -z "${ODOO_REFERENCE_REPOSITORIES:-}" ] || [ "${ODOO_REFERENCE_REPOSITORIES:-}" = "[]" ]; then
+          exit 0
+        fi
+        if [ -n "${REFERENCE_REPOSITORY_TOKEN:-}" ] && [ "$REFERENCE_REPOSITORY_TOKEN" != "default" ]; then
+          git config --global url."https://x-access-token:${REFERENCE_REPOSITORY_TOKEN}@github.com/".insteadOf "https://github.com/"
+        fi
+        echo "$ODOO_REFERENCE_REPOSITORIES" | jq -c '.[]' | while read -r repository; do
+          name="$(echo "$repository" | jq -r '.name // ""')"
+          git_url="$(echo "$repository" | jq -r '.git_url // ""')"
+          git_branch="$(echo "$repository" | jq -r '.git_branch // .git_ref // ""')"
+          if [ -z "$git_url" ]; then
+            continue
+          fi
+          safe_name="$(echo "${name:-reference}" | tr -cs '[:alnum:]_.-' '-' | sed 's/^-//;s/-$//')"
+          if [ -z "$safe_name" ]; then
+            safe_name="reference"
+          fi
+          target=".odoo-reference-repositories/$safe_name"
+          suffix=1
+          while [ -e "$target" ]; do
+            suffix=$((suffix + 1))
+            target=".odoo-reference-repositories/${safe_name}-${suffix}"
+          done
+          if [ -n "$git_branch" ]; then
+            git clone --depth 1 --branch "$git_branch" "$git_url" "$target"
+          else
+            git clone --depth 1 "$git_url" "$target"
+          fi
+        done
+    - name: Validate AI Gateway configuration
+      shell: bash
+      env:
+        AI_GATEWAY_BASE_URL: ${{ secrets.AI_GATEWAY_BASE_URL }}
+        AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+        AI_GATEWAY_MODEL: ${{ secrets.AI_GATEWAY_MODEL }}
+      run: |
+        set -euo pipefail
+        missing=""
+        for key in AI_GATEWAY_BASE_URL AI_GATEWAY_API_KEY AI_GATEWAY_MODEL; do
+          value="${!key:-}"
+          if [ -z "$value" ] || [ "$value" = "default" ]; then
+            missing="$missing $key"
+          fi
+        done
+        if [ -n "$missing" ]; then
+          echo "::error title=Missing AI Gateway secrets::Configure these GitHub Actions repository secrets:$missing"
+          exit 1
+        fi
+    - name: Run AI Gateway Plan
+      shell: bash
+      env:
+        AI_GATEWAY_BASE_URL: ${{ secrets.AI_GATEWAY_BASE_URL }}
+        AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+        AI_GATEWAY_MODEL: ${{ secrets.AI_GATEWAY_MODEL }}
+        PLAN_FILE: .github/odoo-ai-plans/task-${{ inputs.odoo_task_id }}.md
+        ODOO_TASK_ID: ${{ inputs.odoo_task_id }}
+        ODOO_TASK_URL: ${{ inputs.odoo_task_url }}
+        ODOO_PROJECT_NAME: ${{ inputs.odoo_project_name }}
+        ODOO_PROJECT_ID: ${{ inputs.odoo_project_id }}
+        ODOO_TASK_NAME: ${{ inputs.odoo_task_name }}
+        ODOO_TASK_DESCRIPTION: ${{ inputs.odoo_task_description }}
+        ODOO_AI_CORRECTION: ${{ inputs.odoo_ai_correction }}
+        ODOO_REFERENCE_REPOSITORIES: ${{ inputs.odoo_reference_repositories }}
+      run: |
+        set -euo pipefail
+        mkdir -p .github/odoo-ai-plans
+        python3 - <<'INNER_PLAN'
+        import json, os, ssl, urllib.error, urllib.request
+        from pathlib import Path
+        base_url = os.environ['AI_GATEWAY_BASE_URL'].rstrip('/')
+        api_key = os.environ['AI_GATEWAY_API_KEY']
+        model = os.environ['AI_GATEWAY_MODEL']
+        prompt = f'''Review the Odoo task context and create an implementation plan only.
+        Do not modify application code.
+        The plan must include: context review, proposed approach, affected modules/files, migration/security notes, test cases, risks, open questions, and validation checklist.
+
+        Task ID: {os.environ.get('ODOO_TASK_ID', '')}
+        Task URL: {os.environ.get('ODOO_TASK_URL', '')}
+        Project: {os.environ.get('ODOO_PROJECT_NAME', '')} ({os.environ.get('ODOO_PROJECT_ID', '')})
+        Title: {os.environ.get('ODOO_TASK_NAME', '')}
+
+        Description:
+        {os.environ.get('ODOO_TASK_DESCRIPTION', '')}
+
+        Technical correction / feedback:
+        {os.environ.get('ODOO_AI_CORRECTION', '')}
+
+        Reference repositories:
+        {os.environ.get('ODOO_REFERENCE_REPOSITORIES', '[]')}
+
+        Repository agent rules:
+        Read and follow agents.yaml and .github/skills/odoo-development/SKILL.md.
+        '''
+        payload = {'model': model, 'messages': [{'role': 'system', 'content': 'You are an expert Odoo 19.0 developer. Return clear markdown only.'}, {'role': 'user', 'content': prompt}], 'temperature': 0.2}
+        request = urllib.request.Request(f'{base_url}/v1/chat/completions', data=json.dumps(payload).encode(), headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}, method='POST')
+        def read_chat_completion(response):
+            raw = response.read().decode('utf-8', errors='replace').strip()
+            try:
+                data = json.loads(raw)
+                choice = (data.get('choices') or [{}])[0]
+                message = choice.get('message') or {}
+                return (message.get('content') or choice.get('text') or '').strip()
+            except json.JSONDecodeError:
+                chunks = []
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if line.startswith('data:'):
+                        line = line[5:].strip()
+                    if not line or line == '[DONE]':
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (item.get('choices') or [{}])[0]
+                    delta = choice.get('delta') or {}
+                    message = choice.get('message') or {}
+                    piece = delta.get('content') or message.get('content') or choice.get('text') or ''
+                    if piece:
+                        chunks.append(piece)
+                return ''.join(chunks).strip()
+        def open_ai_gateway(request):
+            try:
+                return urllib.request.urlopen(request, timeout=900)
+            except urllib.error.URLError as error:
+                reason = getattr(error, 'reason', None)
+                if isinstance(reason, ssl.SSLCertVerificationError):
+                    print(f'::warning title=AI Gateway TLS verification failed::Retrying with certificate verification disabled: {reason}')
+                    context = ssl._create_unverified_context()
+                    return urllib.request.urlopen(request, timeout=900, context=context)
+                raise
+        with open_ai_gateway(request) as response:
+            content = read_chat_completion(response)
+        Path(os.environ['PLAN_FILE']).write_text(content + '\n', encoding='utf-8')
+        INNER_PLAN
+        git add "$PLAN_FILE"
+        git diff --cached --binary HEAD > odoo-plan.patch
+        if [ ! -s odoo-plan.patch ]; then
+          echo "No plan file changes were detected." > odoo-plan.patch
+        fi
+    - name: Upload AI plan patch
+      uses: actions/upload-artifact@v4
+      with:
+        name: odoo-plan-patch
+        path: odoo-plan.patch
+        if-no-files-found: error
+    - name: Upload AI plan file
+      uses: actions/upload-artifact@v4
+      with:
+        name: odoo-plan-file
+        path: .github/odoo-ai-plans/task-${{ inputs.odoo_task_id }}.md
+        if-no-files-found: error
+  run_odoo_task:
+    name: Run Odoo Task
+    runs-on: ubuntu-latest
+    needs: review_pr
+    if: needs.review_pr.outputs.execution_mode == 'generate'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Checkout reference repositories
+      shell: bash
+      env:
+        ODOO_REFERENCE_REPOSITORIES: ${{ inputs.odoo_reference_repositories }}
+        REFERENCE_REPOSITORY_TOKEN: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
+      run: |
+        set -euo pipefail
+        mkdir -p .odoo-reference-repositories
+        if [ -z "${ODOO_REFERENCE_REPOSITORIES:-}" ] || [ "${ODOO_REFERENCE_REPOSITORIES:-}" = "[]" ]; then
+          exit 0
+        fi
+        if [ -n "${REFERENCE_REPOSITORY_TOKEN:-}" ] && [ "$REFERENCE_REPOSITORY_TOKEN" != "default" ]; then
+          git config --global url."https://x-access-token:${REFERENCE_REPOSITORY_TOKEN}@github.com/".insteadOf "https://github.com/"
+        fi
+        echo "$ODOO_REFERENCE_REPOSITORIES" | jq -c '.[]' | while read -r repository; do
+          name="$(echo "$repository" | jq -r '.name // ""')"
+          git_url="$(echo "$repository" | jq -r '.git_url // ""')"
+          git_branch="$(echo "$repository" | jq -r '.git_branch // .git_ref // ""')"
+          if [ -z "$git_url" ]; then
+            continue
+          fi
+          safe_name="$(echo "${name:-reference}" | tr -cs '[:alnum:]_.-' '-' | sed 's/^-//;s/-$//')"
+          if [ -z "$safe_name" ]; then
+            safe_name="reference"
+          fi
+          target=".odoo-reference-repositories/$safe_name"
+          suffix=1
+          while [ -e "$target" ]; do
+            suffix=$((suffix + 1))
+            target=".odoo-reference-repositories/${safe_name}-${suffix}"
+          done
+          if [ -n "$git_branch" ]; then
+            git clone --depth 1 --branch "$git_branch" "$git_url" "$target"
+          else
+            git clone --depth 1 "$git_url" "$target"
+          fi
+        done
+    - name: Validate AI Gateway configuration
+      shell: bash
+      env:
+        AI_GATEWAY_BASE_URL: ${{ secrets.AI_GATEWAY_BASE_URL }}
+        AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+        AI_GATEWAY_MODEL: ${{ secrets.AI_GATEWAY_MODEL }}
+      run: |
+        set -euo pipefail
+        missing=""
+        for key in AI_GATEWAY_BASE_URL AI_GATEWAY_API_KEY AI_GATEWAY_MODEL; do
+          value="${!key:-}"
+          if [ -z "$value" ] || [ "$value" = "default" ]; then
+            missing="$missing $key"
+          fi
+        done
+        if [ -n "$missing" ]; then
+          echo "::error title=Missing AI Gateway secrets::Configure these GitHub Actions repository secrets:$missing"
+          exit 1
+        fi
+    - name: Run AI Gateway Generate Code
+      shell: bash
+      env:
+        AI_GATEWAY_BASE_URL: ${{ secrets.AI_GATEWAY_BASE_URL }}
+        AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+        AI_GATEWAY_MODEL: ${{ secrets.AI_GATEWAY_MODEL }}
+        ODOO_TASK_ID: ${{ inputs.odoo_task_id }}
+        ODOO_TASK_URL: ${{ inputs.odoo_task_url }}
+        ODOO_PROJECT_NAME: ${{ inputs.odoo_project_name }}
+        ODOO_PROJECT_ID: ${{ inputs.odoo_project_id }}
+        ODOO_TASK_NAME: ${{ inputs.odoo_task_name }}
+        ODOO_TASK_DESCRIPTION: ${{ inputs.odoo_task_description }}
+        ODOO_AI_PLAN: ${{ inputs.odoo_ai_plan }}
+        ODOO_AI_CORRECTION: ${{ inputs.odoo_ai_correction }}
+        ODOO_REFERENCE_REPOSITORIES: ${{ inputs.odoo_reference_repositories }}
+      run: |
+        set -euo pipefail
+        python3 - <<'INNER_GENERATE'
+        import json, os, re, ssl, subprocess, urllib.error, urllib.request
+        from pathlib import Path
+        base_url = os.environ['AI_GATEWAY_BASE_URL'].rstrip('/')
+        api_key = os.environ['AI_GATEWAY_API_KEY']
+        model = os.environ['AI_GATEWAY_MODEL']
+        try:
+            tree = subprocess.check_output(['git', 'ls-files'], text=True, stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            tree = ''
+        prompt = f'''Implement the approved Odoo task plan by returning JSON only.
+        Do not return a git diff or markdown.
+        Return a JSON object: {{"files": [{{"path": "relative/path.py", "content": "full UTF-8 file content"}}], "notes": "optional notes"}}.
+        Paths must be repository-relative and safe.
+
+        Task ID: {os.environ.get('ODOO_TASK_ID', '')}
+        Task URL: {os.environ.get('ODOO_TASK_URL', '')}
+        Project: {os.environ.get('ODOO_PROJECT_NAME', '')} ({os.environ.get('ODOO_PROJECT_ID', '')})
+        Title: {os.environ.get('ODOO_TASK_NAME', '')}
+
+        Description:
+        {os.environ.get('ODOO_TASK_DESCRIPTION', '')}
+
+        Approved plan:
+        {os.environ.get('ODOO_AI_PLAN', '')}
+
+        Technical correction / feedback:
+        {os.environ.get('ODOO_AI_CORRECTION', '')}
+
+        Repository tracked files:
+        {tree[:20000]}
+
+        Reference repositories:
+        {os.environ.get('ODOO_REFERENCE_REPOSITORIES', '[]')}
+
+        Repository agent rules:
+        Read and follow agents.yaml and .github/skills/odoo-development/SKILL.md.
+        '''
+        payload = {'model': model, 'messages': [{'role': 'system', 'content': 'You are an expert Odoo 19.0 developer. Return JSON only in the requested files/content format.'}, {'role': 'user', 'content': prompt}], 'temperature': 0.2}
+        request = urllib.request.Request(f'{base_url}/v1/chat/completions', data=json.dumps(payload).encode(), headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}, method='POST')
+        def read_chat_completion(response):
+            raw = response.read().decode('utf-8', errors='replace').strip()
+            try:
+                data = json.loads(raw)
+                choice = (data.get('choices') or [{}])[0]
+                message = choice.get('message') or {}
+                return (message.get('content') or choice.get('text') or '').strip()
+            except json.JSONDecodeError:
+                chunks = []
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if line.startswith('data:'):
+                        line = line[5:].strip()
+                    if not line or line == '[DONE]':
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (item.get('choices') or [{}])[0]
+                    delta = choice.get('delta') or {}
+                    message = choice.get('message') or {}
+                    piece = delta.get('content') or message.get('content') or choice.get('text') or ''
+                    if piece:
+                        chunks.append(piece)
+                return ''.join(chunks).strip()
+        def strip_fences(content):
+            content = content.strip()
+            if content.startswith('```'):
+                lines = content.splitlines()
+                if lines and lines[0].startswith('```'):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith('```'):
+                    lines = lines[:-1]
+                content = '\n'.join(lines).strip()
+            return content
+        def extract_json(content):
+            content = strip_fences(content)
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                match = re.search(r'\{.*\}', content, re.S)
+                if match:
+                    return json.loads(match.group(0))
+                raise
+        def safe_path(path):
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError('file path must be a non-empty string')
+            path = path.strip().replace('\\', '/')
+            if path.startswith(('/', './', '../')) or '/../' in f'/{path}/':
+                raise ValueError(f'unsafe file path: {path}')
+            return path
+        def open_ai_gateway(request):
+            try:
+                return urllib.request.urlopen(request, timeout=900)
+            except urllib.error.URLError as error:
+                reason = getattr(error, 'reason', None)
+                if isinstance(reason, ssl.SSLCertVerificationError):
+                    print(f'::warning title=AI Gateway TLS verification failed::Retrying with certificate verification disabled: {reason}')
+                    context = ssl._create_unverified_context()
+                    return urllib.request.urlopen(request, timeout=900, context=context)
+                raise
+        with open_ai_gateway(request) as response:
+            content = read_chat_completion(response)
+        Path('ai-gateway-response.json').write_text(content + '\n', encoding='utf-8')
+        report_dir = Path('.github/odoo-ai-reports')
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_file = report_dir / f"task-{os.environ.get('ODOO_TASK_ID', '')}.md"
+        try:
+            payload = extract_json(content)
+            files = payload.get('files') or []
+            if not isinstance(files, list):
+                raise ValueError('JSON field files must be a list')
+            written = []
+            for file_info in files:
+                if not isinstance(file_info, dict):
+                    raise ValueError('each file entry must be an object')
+                relative_path = safe_path(file_info.get('path'))
+                file_content = file_info.get('content')
+                if not isinstance(file_content, str):
+                    raise ValueError(f'content for {relative_path} must be a string')
+                target = Path(relative_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(file_content, encoding='utf-8')
+                written.append(relative_path)
+            notes = payload.get('notes') or ''
+            lines = ['## AI Gateway Report', '', '### Status', f'- Wrote {len(written)} file(s) from JSON response.']
+            if written:
+                lines += ['', '### Files'] + [f'- `{path}`' for path in written]
+            if notes:
+                lines += ['', '### Notes', str(notes)]
+            report_file.write_text('\n'.join(lines).strip() + '\n', encoding='utf-8')
+        except Exception as error:
+            error_report = '## AI Gateway Report\n\n### Status\n- The AI response was not valid JSON in the expected files/content format, so no code was applied automatically.\n\n### Error\n%s\n\n### AI Response\n\n%s\n' % (error, content)
+            report_file.write_text(error_report, encoding='utf-8')
+        INNER_GENERATE
+        git add --all
+        git diff --cached --binary HEAD > odoo-generated.patch
+        if [ ! -s odoo-generated.patch ]; then
+          echo "No generated code changes were detected." > odoo-generated.patch
+        fi
+    - name: Upload AI gateway raw response
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ai-gateway-response
+        path: ai-gateway-response.json
+        if-no-files-found: ignore
+    - name: Upload generated patch
+      uses: actions/upload-artifact@v4
+      with:
+        name: odoo-generated-patch
+        path: odoo-generated.patch
+        if-no-files-found: error
+  post_feedback:
+    name: Post Feedback
+    runs-on: ubuntu-latest
+    needs:
+    - review_pr
+    - describe_plan
+    - run_odoo_task
+    if: always()
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Download AI plan patch
+      if: needs.describe_plan.result == 'success'
+      uses: actions/download-artifact@v4
+      with:
+        name: odoo-plan-patch
+        path: .
+    - name: Download generated patch
+      if: needs.run_odoo_task.result == 'success'
+      uses: actions/download-artifact@v4
+      with:
+        name: odoo-generated-patch
+        path: .
+    - name: Apply workflow patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        PATCH_FILE=""
+        if [ -f odoo-plan.patch ]; then
+          PATCH_FILE="odoo-plan.patch"
+        fi
+        if [ -f odoo-generated.patch ]; then
+          PATCH_FILE="odoo-generated.patch"
+        fi
+        if [ -z "$PATCH_FILE" ]; then
+          exit 0
+        fi
+        if grep -q "No .* changes were detected." "$PATCH_FILE"; then
+          exit 0
+        fi
+        git apply --index "$PATCH_FILE"
+    - name: Create or update pull request
+      id: create_pull_request
+      uses: peter-evans/create-pull-request@v7
+      with:
+        token: ${{ github.token }}
+        branch: ${{ needs.review_pr.outputs.branch_name }}
+        delete-branch: false
+        title: ${{ needs.review_pr.outputs.pr_title }}
+        body: |
+          Generated from Odoo task ${{ inputs.odoo_task_id }}.
+
+          Task: ${{ inputs.odoo_task_url }}
+
+          Project: ${{ inputs.odoo_project_name }} (${{ inputs.odoo_project_id }})
+
+          AI Provider: ${{ needs.review_pr.outputs.ai_provider }}
+
+          Execution Mode: ${{ needs.review_pr.outputs.execution_mode }}
+    - name: Download AI plan file
+      if: needs.describe_plan.result == 'success'
+      uses: actions/download-artifact@v4
+      with:
+        name: odoo-plan-file
+        path: .github/odoo-ai-plan-artifact
+    - name: Build AI feedback
+      shell: bash
+      env:
+        EXECUTION_MODE: ${{ needs.review_pr.outputs.execution_mode }}
+        PLAN_RESULT: ${{ needs.describe_plan.result }}
+        RUN_RESULT: ${{ needs.run_odoo_task.result }}
+        PR_URL: ${{ steps.create_pull_request.outputs['pull-request-url'] }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        if [ -z "$PR_URL" ]; then
+          PR_URL="Not created"
+        fi
+        if [ "$EXECUTION_MODE" = "plan" ]; then
+          PLAN_FILE=".github/odoo-ai-plans/task-${{ inputs.odoo_task_id }}.md"
+          PLAN_ARTIFACT_FILE="$(find .github/odoo-ai-plan-artifact -type f -name "task-${{ inputs.odoo_task_id }}.md" -print -quit 2>/dev/null || true)"
+          cat > ai-feedback.md <<EOF
+        ## AI Plan
+
+        ### Workflow Status
+        - Plan job result: $PLAN_RESULT
+        - Pull request: $PR_URL
+        - Workflow run: $RUN_URL
+
+        EOF
+          if [ -f "$PLAN_FILE" ]; then
+            cat "$PLAN_FILE" >> ai-feedback.md
+          elif [ -f "$PLAN_ARTIFACT_FILE" ]; then
+            cat "$PLAN_ARTIFACT_FILE" >> ai-feedback.md
+          else
+            cat >> ai-feedback.md <<EOF
+        ### Missing Plan File
+        The AI plan file was not found. Review workflow logs before approving generation.
+        EOF
+          fi
+        else
+          REPORT_FILE=".github/odoo-ai-reports/task-${{ inputs.odoo_task_id }}.md"
+          cat > ai-feedback.md <<EOF
+        ## AI Report
+
+        ### Summary
+        - Generated code from the approved Odoo AI plan using AI Gateway.
+        - Workflow result: $RUN_RESULT
+        - Pull request: $PR_URL
+        - Workflow run: $RUN_URL
+
+        ### Task
+        - ID: ${{ inputs.odoo_task_id }}
+        - Name: ${{ inputs.odoo_task_name }}
+        - URL: ${{ inputs.odoo_task_url }}
+        - Project: ${{ inputs.odoo_project_name }} (${{ inputs.odoo_project_id }})
+
+        EOF
+          if [ -f "$REPORT_FILE" ]; then
+            cat "$REPORT_FILE" >> ai-feedback.md
+          fi
+        fi
+    - name: Comment AI feedback on pull request
+      id: ai_feedback_comment
+      if: always() && steps.create_pull_request.outputs['pull-request-number'] != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ steps.create_pull_request.outputs['pull-request-number'] }}
+      run: |
+        set -euo pipefail
+        response="$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" --field body="$(cat ai-feedback.md)")"
+        echo "comment_url=$(echo "$response" | jq -r '.html_url // ""')" >> "$GITHUB_OUTPUT"
