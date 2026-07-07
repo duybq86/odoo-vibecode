@@ -1,0 +1,31 @@
+version: 1
+project_type: odoo
+default_agent: ai_gateway
+description: Agent routing for Odoo AI Gen Code. Priority project rules are merged into rules.
+rules:
+- Load .github/skills/odoo-development/SKILL.md before changing Odoo code.
+- Keep generated changes focused on the Odoo task description and technical correction feedback.
+- Do not commit secrets, tokens, local logs, virtual environments, or generated dependency folders.
+- Odoo target version is 19.0.
+- Do not rename legacy modules such as `custom_*` without an explicit migration task.
+- Do not rename stable XML IDs, model technical names, fields, or security groups without an explicit migration plan.
+- Do not remove user or teammate changes that are unrelated to the current request.
+- Do not introduce broad refactors while fixing a narrow issue.
+- Do not duplicate existing Odoo/core/project logic when inheritance or extension is sufficient.
+- Do not leave `print`, temporary debug code, unused imports, or test-only data in production code.
+- Technical code, variables, method names, XML IDs, and docstrings must use English.
+- Python should follow Odoo API conventions, PEP8, `super()`, and `@api.model_create_multi` for multi-record `create` overrides.
+- New models must define `_description`.
+- New user-accessible models or wizards must include security access rules.
+- 'Field naming must follow Odoo conventions:'
+- '`Many2one`: suffix `_id`'
+- '`One2many` / `Many2many`: suffix `_ids`'
+- 'Boolean: prefix such as `is_`, `has_`, `allow_`, or `can_`'
+- XML inheritance must use stable XPath expressions and verified XML IDs.
+- 'Manifest `data` should be ordered as: security, data, wizard, views, report.'
+- Python syntax check for changed `.py` files.
+- XML syntax check for changed `.xml` files.
+- Manifest review for dependency and file load order.
+- Odoo module update for the affected module when an environment and database are available.
+- Frontend/manual UI verification when JS, XML templates, SCSS, or assets change. If validation cannot run, AI must state
+  the reason clearly in the final response.
